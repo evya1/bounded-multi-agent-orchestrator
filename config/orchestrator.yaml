@@ -1,0 +1,75 @@
+# Bounded multi-agent orchestrator — control-plane policy.
+#
+# Nothing here is a project requirement. This file is *our* development-control
+# policy plus pointers at the project's own authoritative planning artifacts.
+
+repos:
+  police:
+    path: /root/police_repo
+    origin: https://github.com/evya1/police_repo.git
+    default_base: origin/master
+  thief:
+    path: /root/thief_repo
+    origin: https://github.com/evya1/thief_repo.git
+    default_base: origin/master
+
+# Where the project's authoritative planning artifacts live inside each repo.
+# These mirror config/repo_quality.toml in the role repositories.
+project:
+  task_dirs: ["docs/tasks"]
+  requirement_register: docs/spec/CANONICAL_REQUIREMENTS.md
+  open_register: docs/spec/OPEN_QUESTIONS.md
+  input_register: docs/inputs/INPUT_REGISTER.md
+  decision_register: docs/spec/OPEN_QUESTIONS.md
+
+  # Always part of a worker's bounded context, per the repo's AGENTS.md.
+  always_context: ["AGENTS.md"]
+
+  # A task body may *explicitly* name a boundary contract / ADR / mechanism by
+  # path. Only paths under these directories are picked up from body prose, and
+  # only when the path actually exists. IDs mentioned in prose are never
+  # resolved into context — only frontmatter `implements` / `gates` are.
+  body_reference_dirs: ["docs/decisions/", "docs/contracts/", "docs/mechanisms/"]
+
+  # Decision-register cells that mean "not decided yet".
+  unresolved_decision_markers: ["TBD_TEAM_DECISION", "TBD", "—", ""]
+  # INPUT_REGISTER Status values that mean the input actually arrived.
+  resolved_input_statuses: ["RECEIVED", "VERIFIED", "RECEIVED_VERIFIED"]
+
+  open_items_heading: "Active OPEN items"
+  decision_items_heading: "Implementation Decision Register"
+
+# A diff touching any of these ALWAYS requires human approval, whatever the
+# task's risk level says. Mirrors the governance rules in AGENTS.md.
+governance_paths:
+  - AGENTS.md
+  - CONTRIBUTING.md
+  - docs/PRD.md
+  - docs/PLAN.md
+  - docs/TODO.md
+  - docs/spec/
+  - docs/decisions/
+  - docs/changes/
+
+# ORCHESTRATION review gates, keyed by the task's `risk` field. These are our
+# development-control policy and are deliberately independent of the project's
+# own `gates:` (PLANQ-*, G-OFFICIAL, blocks: start/criterion/integration).
+review_policy:
+  high: [plan, diff]
+  medium: [diff]
+  low: []
+
+# Repository-global whole-environment integration artifacts. A task whose
+# write_set touches any of these paths acquires the named exclusive resource for
+# its repository; no concurrent task in the SAME repository may hold it.
+# Police and Thief hold independent instances of each resource.
+resources:
+  dependency_manifest: ["pyproject.toml"]
+  dependency_lock: ["uv.lock"]
+
+budget:
+  daily_openrouter_budget_usd: 4.00
+  reserve_usd: 0.75
+  max_usd_per_call: 0.50
+  # Used only to size a pre-call estimate when a provider gives no usage.
+  estimate_output_tokens: 4000

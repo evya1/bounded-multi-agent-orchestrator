@@ -1,0 +1,46 @@
+{
+  "comment": "Shared expectations for the bounded-write policy. Checked by BOTH orchestrator/write_guard.py (pytest) and orchestrator/pi_ext/write_guard.ts (node runner), so the pre-write guard and the Python policy cannot drift apart. Paths are relative to the fixture worktree unless marked absolute.",
+  "write_set": ["pyproject.toml", "uv.lock", "tests/", "src/pkg"],
+  "cases": [
+    {"name": "exact owned file", "path": "pyproject.toml", "allowed": true},
+    {"name": "second exact owned file", "path": "uv.lock", "allowed": true},
+    {"name": "child of owned directory", "path": "tests/test_runtime.py", "allowed": true},
+    {"name": "nested child of owned directory", "path": "tests/unit/test_deep.py", "allowed": true},
+    {"name": "child of owned dir declared without slash", "path": "src/pkg/module.py", "allowed": true},
+    {"name": "dot-slash prefix on owned file", "path": "./pyproject.toml", "allowed": true},
+    {"name": "owned file reached via redundant traversal", "path": "tests/../pyproject.toml", "allowed": true},
+
+    {"name": "undeclared sibling", "path": "setup.py", "allowed": false, "denial": "NOT_IN_WRITE_SET"},
+    {"name": "undeclared sibling of an owned dir", "path": "src/other.py", "allowed": false, "denial": "NOT_IN_WRITE_SET"},
+    {"name": "governance file not in write set", "path": "docs/PRD.md", "allowed": false, "denial": "NOT_IN_WRITE_SET"},
+    {"name": "prefix lookalike is not a child", "path": "tests-extra/x.py", "allowed": false, "denial": "NOT_IN_WRITE_SET"},
+    {"name": "worktree root itself", "path": ".", "allowed": false, "denial": "NOT_IN_WRITE_SET"},
+
+    {"name": "parent traversal escape", "path": "../escaped.txt", "allowed": false, "denial": "OUTSIDE_WORKTREE"},
+    {"name": "deep traversal escape", "path": "../../../../etc/passwd", "allowed": false, "denial": "OUTSIDE_WORKTREE"},
+    {"name": "traversal that re-enters a lookalike sibling", "path": "../sibling/pyproject.toml", "allowed": false, "denial": "OUTSIDE_WORKTREE"},
+    {"name": "absolute path outside the worktree", "path": "/etc/passwd", "absolute": true, "allowed": false, "denial": "OUTSIDE_WORKTREE"},
+    {"name": "absolute path to the real role repo", "path": "/tmp/definitely-not-the-worktree/pyproject.toml", "absolute": true, "allowed": false, "denial": "OUTSIDE_WORKTREE"},
+
+    {"name": "empty path", "path": "", "allowed": false, "denial": "EMPTY_PATH"},
+    {"name": "whitespace path", "path": "   ", "allowed": false, "denial": "EMPTY_PATH"},
+
+    {"name": "write through a symlinked directory pointing out", "path": "escape-dir/pyproject.toml", "allowed": false, "denial": "SYMLINK_ESCAPE", "requires_symlink": true},
+    {"name": "write to a symlinked file pointing out", "path": "uv.lock", "allowed": false, "denial": "SYMLINK_ESCAPE", "requires_symlink": "uv.lock"},
+    {"name": "new file under a symlinked owned dir pointing out", "path": "tests/new_test.py", "allowed": false, "denial": "SYMLINK_ESCAPE", "requires_symlink": "tests"}
+  ],
+  "tool_cases": [
+    {"name": "read is allowed", "tool": "read", "input": {"path": "docs/PRD.md"}, "allowed": true},
+    {"name": "ls is allowed", "tool": "ls", "input": {"path": "."}, "allowed": true},
+    {"name": "grep is allowed", "tool": "grep", "input": {"pattern": "x"}, "allowed": true},
+    {"name": "find is allowed", "tool": "find", "input": {"pattern": "*.py"}, "allowed": true},
+    {"name": "bash is refused", "tool": "bash", "input": {"command": "ls"}, "allowed": false, "denial": "TOOL_NOT_ALLOWED"},
+    {"name": "unknown tool is refused by default", "tool": "some_future_write_tool", "input": {"path": "pyproject.toml"}, "allowed": false, "denial": "TOOL_NOT_ALLOWED"},
+    {"name": "write to owned path", "tool": "write", "input": {"path": "pyproject.toml", "content": "x"}, "allowed": true},
+    {"name": "edit of owned path", "tool": "edit", "input": {"path": "tests/test_x.py"}, "allowed": true},
+    {"name": "write to unowned path", "tool": "write", "input": {"path": "docs/PRD.md", "content": "x"}, "allowed": false, "denial": "NOT_IN_WRITE_SET"},
+    {"name": "write escaping the worktree", "tool": "write", "input": {"path": "../escaped.txt"}, "allowed": false, "denial": "OUTSIDE_WORKTREE"},
+    {"name": "write with no path argument", "tool": "write", "input": {"content": "x"}, "allowed": false, "denial": "NO_PATH_ARGUMENT"},
+    {"name": "alternate file_path argument name is honoured", "tool": "write", "input": {"file_path": "pyproject.toml"}, "allowed": true}
+  ]
+}

@@ -1,0 +1,155 @@
+# Model routing table — CONFIGURATION, not architecture.
+#
+# Copy to config/models.yaml to change routing without touching Python. The
+# loader prefers models.yaml and falls back to this file.
+#
+# Cost figures are catalog metadata (USD per million tokens) read from Pi's
+# non-secret model store. They are ESTIMATES for pre-call budgeting. Actual
+# spend is taken from Pi's reported per-call usage where available.
+
+adapters:
+  pi:
+    executable: pi
+    # Discovered from the installed Pi build (0.84.2):
+    #   -p / --print       non-interactive
+    #   --mode json        JSON event stream on stdout (carries usage + cost)
+    #   --provider/--model provider and model selection
+    #   -nt / --no-tools   no tools at all (planner / reviewer)
+    #   -t / --tools       strict allowlist for built-in AND extension tools
+    #   -xt/--exclude-tools denylist
+    #   --thinking <level> off|minimal|low|medium|high|xhigh|max
+    print_flag: "-p"
+    json_mode_flag: ["--mode", "json"]
+    enabled: true
+  claude:
+    executable: claude
+    enabled: false          # separate adapter; off by default
+
+providers:
+  # ---------------------------------------------------------------- local/free
+  llama_cpp:
+    kind: local
+    paid: false
+    # Pi talks to a llama.cpp ROUTER server (llama-server started WITHOUT -m).
+    # Configured through LLAMA_BASE_URL / LLAMA_API_KEY or `/login llama.cpp`.
+    pi_provider: llama.cpp
+    base_url_env: LLAMA_BASE_URL
+    default_base_url: http://127.0.0.1:8080
+    # NOT SET DELIBERATELY. Two local Qwen GGUFs exist on this machine and the
+    # router was not running at discovery time, so the exact router-side model
+    # ID could not be observed. `doctor` reports this as UNDISCOVERED and the
+    # router REFUSES local execution until a human fills this in.
+    model_id: null
+    discovered_candidates:
+      - file: /root/local-agent-stack/models/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf
+        label: "Qwen3.6 35B-A3B UD-Q4_K_M (the user's 'Qwen3.6')"
+        tool_use: true
+        reasoning: true        # emits reasoning_content before tool calls
+        context: 65536
+        note: "RUNBOOK serves this single-model on port 8091, not router mode."
+      - file: /root/local-agent-stack/models/Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf
+        label: "Qwen3-Coder 30B-A3B Q4_K_M"
+        tool_use: true
+        reasoning: false
+        context: 65536
+        note: "RUNBOOK serves this single-model on port 8090, not router mode."
+
+  # --------------------------------------------------------- OpenRouter / paid
+  openrouter:
+    kind: cloud
+    paid: true
+    pi_provider: openrouter
+    api_key_env: OPENROUTER_API_KEY
+    catalog: /root/.pi/agent/models-store.json   # non-secret; carries cost metadata
+
+# Model definitions. `family` drives the diversity policy: an important review
+# should not come from the same family that wrote the code.
+models:
+  local-qwen36:
+    provider: llama_cpp
+    family: qwen
+    cost_usd_per_mtok: {input: 0.0, output: 0.0}
+  deepseek-v4-pro:
+    provider: openrouter
+    id: deepseek/deepseek-v4-pro
+    family: deepseek
+    cost_usd_per_mtok: {input: 1.168, output: 2.336, cache_read: 0.09855}
+  gpt-5.3-codex:
+    provider: openrouter
+    id: openai/gpt-5.3-codex
+    family: openai
+    cost_usd_per_mtok: {input: 1.75, output: 14.0, cache_read: 0.175}
+  gpt-5.4:
+    provider: openrouter
+    id: openai/gpt-5.4
+    family: openai
+    cost_usd_per_mtok: {input: 2.5, output: 15.0, cache_read: 0.25}
+  claude-opus-4.8:
+    provider: openrouter
+    id: anthropic/claude-opus-4.8
+    family: anthropic
+    cost_usd_per_mtok: {input: 5.0, output: 25.0, cache_read: 0.5, cache_write: 6.25}
+
+# Role -> intended model. `fallbacks` are tried in order only when the primary
+# is unavailable, and the router ALWAYS reports the substitution. A frontier
+# reviewer is never silently downgraded: `allow_weaker_fallback: false` makes an
+# unavailable primary a refusal instead.
+roles:
+  local_executor:
+    description: Bounded routine implementation.
+    primary: local-qwen36
+    fallbacks: []
+    allow_weaker_fallback: false
+  value_reasoner:
+    description: Inexpensive strong second opinion / medium reasoning.
+    primary: deepseek-v4-pro
+    fallbacks: [gpt-5.3-codex]
+    allow_weaker_fallback: false
+  code_reviewer:
+    description: Difficult code review, debugging, software-engineering judgment.
+    primary: gpt-5.3-codex
+    fallbacks: []
+    allow_weaker_fallback: false
+  reasoner:
+    description: Difficult architecture, governance, planning, synthesis.
+    primary: gpt-5.4
+    fallbacks: []
+    allow_weaker_fallback: false
+  adversarial_architect:
+    description: Rare escalation. Never a default worker.
+    primary: claude-opus-4.8
+    fallbacks: []
+    allow_weaker_fallback: false
+
+# Escalation: (stage, complexity) -> role. `complexity` defaults to the task's
+# own `risk` field and can be overridden per run with --complexity.
+escalation:
+  low:
+    plan: local_executor
+    implement: local_executor
+    review: value_reasoner
+  medium:
+    plan: value_reasoner
+    implement: local_executor
+    review: code_reviewer
+  high:
+    plan: reasoner
+    implement: local_executor
+    review: code_reviewer
+  very_high:
+    plan: reasoner
+    implement: local_executor
+    review: code_reviewer
+    adversarial: adversarial_architect
+
+# Model privileges per stage. Planners and reviewers get NO tools at all — this
+# is enforced by the adapter's argv, not by asking the model nicely.
+privileges:
+  plan:       {tools: none,  bash: false, write_set_only: false}
+  review:     {tools: none,  bash: false, write_set_only: false}
+  implement:  {tools: edit,  bash: false, write_set_only: true}
+
+diversity:
+  # For these complexity levels, plan / implement / review must not all come
+  # from one model family. Violations are reported, never silently accepted.
+  enforce_for: [high, very_high]

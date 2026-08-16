@@ -1,0 +1,11 @@
+# Runtime state: worktrees, task state, approval receipts, prompts, ledger.
+# Regenerable, and it must never be confused with product code.
+/state/
+/worktrees/
+.venv/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+
+# Live routing overrides may name private endpoints; keep the example checked in.
+/config/models.yaml
