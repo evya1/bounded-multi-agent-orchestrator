@@ -8,15 +8,19 @@ local non-secret catalog.
 
 from __future__ import annotations
 
+import contextlib
+import json
 import shutil
 import subprocess
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
 from . import gitio
 from .adapters import build_adapter
 from .config import Config
-from .model_router import ModelRouter
+from .model_router import ModelRouter, Presence, validate_no_claude_runtime
+from .run_store import RunStore
 
 
 @dataclass
@@ -92,7 +96,8 @@ def run(config: Config) -> list[Check]:
 
     router = ModelRouter(config.models)
     for provider_name, provider in sorted((config.models.get("providers") or {}).items()):
-        if provider.get("api_key_env"):
+        local = provider.get("kind") == "local"
+        if provider.get("api_key_env") and not local:
             present = router.key_available(provider_name)
             checks.append(
                 Check(
@@ -102,23 +107,37 @@ def run(config: Config) -> list[Check]:
                     "(value never read or printed)",
                 )
             )
-        if provider.get("kind") == "local":
-            model_id = provider.get("model_id")
-            candidates = provider.get("discovered_candidates") or []
-            if model_id:
-                checks.append(
-                    Check(f"provider:{provider_name}:model", True, f"model_id={model_id}")
-                )
-            else:
-                labels = "; ".join(str(c.get("label")) for c in candidates)
+        if local:
+            # A local provider is registered in Pi BY AN EXTENSION, which
+            # resolves its own credential. This orchestrator never reads, stores
+            # or prints that value, so there is nothing here to check beyond the
+            # extension being present — availability is the per-model HTTP probe.
+            extension = provider.get("pi_extension")
+            if not extension:
                 checks.append(
                     Check(
-                        f"provider:{provider_name}:model",
+                        f"provider:{provider_name}:extension",
                         False,
-                        f"model_id UNDISCOVERED — {len(candidates)} candidate(s) found, none "
-                        f"chosen automatically: {labels or '(none)'}",
+                        "no pi_extension configured; a bounded worker runs with "
+                        "--no-extensions, so this provider would not resolve",
                     )
                 )
+            else:
+                present = Path(str(extension)).is_file()
+                checks.append(
+                    Check(
+                        f"provider:{provider_name}:extension",
+                        present,
+                        f"{extension}" + ("" if present else ": MISSING"),
+                    )
+                )
+            checks.append(
+                Check(
+                    f"provider:{provider_name}:credentials",
+                    True,
+                    "resolved by the Pi extension; never read, stored or printed here",
+                )
+            )
         if provider.get("catalog"):
             catalog_path = Path(str(provider["catalog"]))
             checks.append(
@@ -133,11 +152,105 @@ def run(config: Config) -> list[Check]:
 
     for model_name in sorted(router.models):
         availability = router.availability(model_name)
+        presence = availability.presence
+        label = {
+            str(Presence.AVAILABLE_NOW): "AVAILABLE",
+            str(Presence.REGISTERED): "REGISTERED / SERVER OFFLINE",
+            str(Presence.CONFIGURED): "CONFIGURED / NOT REACHABLE",
+            str(Presence.UNCONFIGURED): "NOT CONFIGURED",
+        }.get(presence, presence)
         checks.append(
-            Check(f"model:{model_name}", availability.available, availability.detail)
+            Check(f"model:{model_name}", availability.available, f"{label} — {availability.detail}")
         )
 
+    checks.append(_pi_rpc_check(config))
+    checks += _routing_checks(config, router)
+    checks.append(_no_claude_check(config))
+    checks.append(_run_store_check(config))
     return checks
+
+
+def _pi_rpc_check(config: Config) -> Check:
+    """Does ``pi --mode rpc`` actually start and speak the protocol?
+
+    A real spawn, a real ``get_state`` command, a real response — then the child
+    is closed. No model is contacted and nothing is spent: ``get_state`` is
+    answered by the agent process itself.
+    """
+    spec = (config.models.get("adapters") or {}).get("pi") or {}
+    executable = shutil.which(str(spec.get("executable", "pi")))
+    if not executable:
+        return Check("pi:rpc", False, "pi is not on PATH")
+    try:
+        proc = subprocess.Popen(
+            [executable, "--mode", "rpc", "--no-session", "--no-extensions", "-nt"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    except OSError as exc:
+        return Check("pi:rpc", False, f"could not spawn: {exc}")
+    try:
+        assert proc.stdin is not None and proc.stdout is not None
+        proc.stdin.write(json.dumps({"id": "doctor", "type": "get_state"}) + "\n")
+        proc.stdin.flush()
+        deadline = time.monotonic() + 25.0
+        while time.monotonic() < deadline:
+            line = proc.stdout.readline()
+            if not line:
+                break
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if event.get("type") == "response" and event.get("command") == "get_state":
+                return Check("pi:rpc", True, "RPC mode started and answered get_state")
+        return Check("pi:rpc", False, "RPC mode started but did not answer get_state in time")
+    except OSError as exc:
+        return Check("pi:rpc", False, f"RPC handshake failed: {exc}")
+    finally:
+        with contextlib.suppress(OSError, subprocess.TimeoutExpired):
+            proc.stdin.close() if proc.stdin else None
+            proc.terminate()
+            proc.wait(timeout=5)
+
+
+def _routing_checks(config: Config, router: ModelRouter) -> list[Check]:
+    """Which model each role would actually get, and whether it is reachable."""
+    checks: list[Check] = []
+    for role in sorted(router.roles):
+        primary = (router.roles.get(role) or {}).get("primary", "?")
+        availability = router.availability(str(primary))
+        limits = router.limits_for(role)
+        checks.append(
+            Check(
+                f"route:{role}",
+                availability.available,
+                f"{primary} ({availability.presence}) — "
+                f"max_calls={limits.max_model_calls} wall={limits.wall_seconds:.0f}s "
+                f"hard=${limits.hard_usd:.2f}",
+            )
+        )
+    return checks
+
+
+def _no_claude_check(config: Config) -> Check:
+    """The no-Claude runtime guarantee, asserted rather than asserted-about."""
+    refusals = validate_no_claude_runtime(config.models)
+    if refusals:
+        return Check(
+            "runtime:no-claude",
+            False,
+            f"{len(refusals)} ACTIVE Claude/Anthropic route(s): "
+            + "; ".join(refusal.message for refusal in refusals),
+        )
+    return Check("runtime:no-claude", True, "NONE — no active Claude/Anthropic runtime route")
+
+
+def _run_store_check(config: Config) -> Check:
+    ok, detail = RunStore(config.state_dir / "runs").writable()
+    return Check("run-store", ok, detail if ok else f"NOT WRITABLE: {detail}")
 
 
 def render(checks: list[Check]) -> str:

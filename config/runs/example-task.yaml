@@ -1,0 +1,49 @@
+# One bounded task run.
+#
+# A run config names WHAT to run and HOW TO PROVE it. It deliberately cannot
+# name a model, a provider or a budget: routing and budgets are policy and live
+# in config/models.yaml, so a run can never promote itself onto a more expensive
+# model or raise its own ceiling. Attempting to set `model:`, `models:` or
+# `provider:` here is a configuration error, not a silent override.
+#
+#   uv run orchestrate_v4.py run --config config/runs/example-task.yaml --dry-run
+#   uv run orchestrate_v4.py run --config config/runs/example-task.yaml --yes-spend
+
+repo: police
+task: T002
+
+# Defaults to the task's own `risk` field. Only override deliberately: this
+# selects which role serves each stage, and therefore what the run may spend.
+complexity: medium
+
+# Optional. Defaults to the repository's configured default_base.
+# base: origin/master
+
+# The three validation levels. All of them are ordinary shell commands run by
+# Python inside the task worktree; their exit codes decide pass/fail. No model
+# is asked whether its own work passed.
+validation:
+  # LEVEL 1 — targeted and cheap. Runs immediately after a bounded edit, and
+  # again after a fix. Keep it to seconds: this is the loop, not the gate.
+  level1:
+    - uv run pytest tests/unit/test_example.py -q
+    - uv run ruff check src/example
+
+  # LEVEL 2 — component scope. Runs once before the expensive reviewer is
+  # called, so a review is never spent on a change that does not build.
+  level2:
+    - uv run pytest tests/unit -q
+    - uv run ruff check .
+
+  # LEVEL 3 — full integration. Runs ONCE, near merge. This is the expensive
+  # one; it is not re-run after every one-line edit.
+  level3:
+    - uv sync --locked --all-groups
+    - uv run ruff check .
+    - uv run pytest
+    - uv run python scripts/run_quality_gates.py
+
+notes: >-
+  Replace the commands above with the ones this task's repository actually
+  declares. Anything listed here runs with the orchestrator's own privileges
+  inside the task worktree.

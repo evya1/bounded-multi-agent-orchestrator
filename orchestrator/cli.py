@@ -11,6 +11,7 @@ budget verdict, then stops.
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import sys
 from pathlib import Path
@@ -19,62 +20,27 @@ from . import budget as budget_mod
 from . import doctor as doctor_mod
 from . import gitio, prompts, readiness, resources, write_guard
 from .adapters import build_adapter
-from .approvals import ApprovalStore, diff_gate_required, required_gates
+from .approvals import diff_gate_required, required_gates
 from .claiming import evaluate_claim
-from .config import Config, RepoConfig, load_config
+from .config import Config, load_config
 from .context_compiler import ContextCompiler, render_human
 from .errors import OrchestratorError, Reason, Refusal
 from .model_router import ModelRouter
 from .registers import Registers
-from .state import State, StateStore
-from .task_loader import Task, get_task, load_tasks
+from .run_store import RunStore
+from .runner import execute as execute_run
+from .runner import plan as plan_run
+from .session import Session
+from .state import State
+from .task_loader import Task
 from .verifier import IGNORED_PREFIXES, audit_write_set, verify
+from .worker_result import parse_reviewer_result
+from .workflow import RunSpec, summarise
 from .worktrees import WorktreeManager
 
 EXIT_OK = 0
 EXIT_FAIL = 1
 EXIT_REFUSED = 2
-
-
-class Session:
-    """One resolved (config, repo) working context."""
-
-    def __init__(self, config: Config, repo_name: str) -> None:
-        self.config = config
-        self.repo: RepoConfig = config.repo(repo_name)
-        self.registers = Registers(self.repo.path, config.project)
-        self.tasks = load_tasks(self.repo.path, config.project.task_dirs)
-        self.states = StateStore(config)
-        self.approvals = ApprovalStore(config)
-        self.router = ModelRouter(config.models)
-        self.ledger = budget_mod.Ledger(config)
-
-    def task(self, task_id: str) -> Task:
-        return get_task(self.tasks, task_id)
-
-    def base_sha(self, task_id: str) -> str:
-        """The task's recorded worktree base, else the repository's default base."""
-        record = WorktreeManager(self.config).load(self.repo, task_id)
-        if record is not None:
-            return record.base_sha
-        return gitio.rev_parse(self.repo.path, self.repo.default_base)
-
-    def require_worktree(self, task_id: str, fresh: bool = True):
-        """The recorded task worktree, or a refusal.
-
-        There is deliberately NO fallback to the role repository checkout. A
-        forgotten `worktree` step must refuse rather than silently run against
-        the real Police/Thief tree.
-        """
-        manager = WorktreeManager(self.config)
-        return manager.require_fresh(self.repo, task_id) if fresh else manager.require(self.repo, task_id)
-
-    def workspace(self, task_id: str, fresh: bool = True) -> Path:
-        """Where a stage reads and writes: always the recorded task worktree."""
-        return Path(self.require_worktree(task_id, fresh).path)
-
-    def agent_dir(self, task_id: str) -> Path:
-        return WorktreeManager(self.config).agent_dir(self.repo, task_id)
 
 
 def _emit(data: object, as_json: bool, human: str) -> None:
@@ -464,7 +430,15 @@ def _run_stage(args, config: Config, stage: str) -> int:
     elif stage == "review":
         session.states.transition(session.repo, state, State.REVIEWED, f"reviewed by {choice.name}")
         state.provenance["reviewed_by"] = choice.model_id or choice.name
-        state.provenance["review_verdict"] = "APPROVE" if "APPROVE" in result.text[-200:] else "REJECT"
+        # The verdict comes from the STRUCTURED result block, not from looking
+        # for the word APPROVE in prose. A reviewer that merely quotes the word
+        # has not approved anything.
+        parsed = parse_reviewer_result(result.text)
+        state.provenance["review_verdict"] = (
+            parsed.result.verdict if parsed.ok and parsed.result else "UNPARSEABLE"
+        )
+        if not parsed.ok:
+            print(f"\nREVIEW RESULT UNPARSEABLE: {parsed.error}")
         session.states.save(session.repo, state)
         print(result.text[-4000:])
     return EXIT_OK
@@ -650,6 +624,59 @@ def cmd_pr(args, config: Config) -> int:
     return EXIT_OK
 
 
+# ------------------------------------------------------------------------ run
+
+
+def cmd_run(args, config: Config) -> int:
+    """The near-one-command path: preflight -> workers -> gates -> human."""
+    spec = RunSpec.load(args.config_file)
+    if args.complexity:
+        spec = dataclasses.replace(spec, complexity=args.complexity)
+
+    if args.dry_run:
+        report = plan_run(config, spec)
+        _emit(report.as_dict(), args.json, report.render())
+        return EXIT_OK if report.executable else EXIT_REFUSED
+
+    result = execute_run(config, spec, yes_spend=args.yes_spend)
+    _emit(result.as_dict(), args.json, summarise(result))
+    if result.refusals:
+        return EXIT_REFUSED
+    return EXIT_OK if result.ready_for_human else EXIT_FAIL
+
+
+def cmd_runs(args, config: Config) -> int:
+    """Inspect persisted runs. This is what survives a closed terminal."""
+    store = RunStore(config.state_dir / "runs")
+    runs = store.all_runs()
+    if args.task_run_id:
+        runs = [run for run in runs if run.task_run_id == args.task_run_id]
+    payload = []
+    for manifest in runs:
+        # `recover` is the authority on what is true now, not the stale status
+        # field: it re-checks whether a recorded PID is still alive.
+        recovered, verdict = store.recover(manifest.task_run_id)
+        payload.append({**(recovered or manifest).as_dict(), "recovery_verdict": verdict})
+
+    if args.json:
+        print(json.dumps(payload, indent=2))
+        return EXIT_OK
+    if not payload:
+        print("No persisted runs.")
+        return EXIT_OK
+    print(f"{'RUN ID':56} {'ROLE':10} {'STATUS':16} {'COST':>9}  RECOVERY")
+    for row in payload:
+        print(
+            f"{row['task_run_id']:56} {row['role'] or '-':10} {row['status']:16} "
+            f"${row['cost_usd']:8.4f}  {row['recovery_verdict']}"
+        )
+    print(
+        "\nA run that already settled with a persisted result is COMPLETE. Losing this "
+        "process's handle on it is not a reason to run it again."
+    )
+    return EXIT_OK
+
+
 # --------------------------------------------------------------------- budget
 
 
@@ -739,6 +766,19 @@ def build_parser() -> argparse.ArgumentParser:
     sub = repo_task(subparsers.add_parser("pr"))
     sub.add_argument("--dry-run", action="store_true")
     sub.set_defaults(func=cmd_pr)
+
+    sub = subparsers.add_parser("run", help="run one bounded task end to end")
+    sub.add_argument("--config", dest="config_file", required=True, type=Path,
+                     help="path to config/runs/<task>.yaml")
+    sub.add_argument("--complexity", choices=["low", "medium", "high", "very_high"])
+    sub.add_argument("--dry-run", action="store_true",
+                     help="resolve routing, budgets and context; call nothing, change nothing")
+    sub.add_argument("--yes-spend", action="store_true", help="authorize paid model calls")
+    sub.set_defaults(func=cmd_run)
+
+    sub = subparsers.add_parser("runs", help="inspect persisted run state")
+    sub.add_argument("--task-run-id", help="limit to one run")
+    sub.set_defaults(func=cmd_runs)
 
     sub = subparsers.add_parser("budget")
     sub.add_argument("--day", help="UTC date YYYY-MM-DD (default: today)")
