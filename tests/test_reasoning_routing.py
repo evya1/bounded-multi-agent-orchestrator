@@ -80,15 +80,19 @@ def _shipped() -> dict:
 
 
 def test_shipped_routing_matches_the_approved_policy():
+    """The routing table is policy. Changing it should have to change this test."""
     roles = _shipped()["roles"]
     approved = {
-        "scout": ("deepseek-v4-flash", "medium"),
-        "writer": ("glm-5.2", "high"),
+        "scout": ("qwen3.8-27b", "medium"),
+        "scout_remote": ("deepseek-v4-flash", "medium"),
+        "writer": ("gemini-3.7-flash", "high"),
+        "writer_local": ("qwen3-coder-30b", "medium"),
+        "fixer": ("qwen3.8-27b", "medium"),
+        "fixer_remote": ("gemini-3.7-flash", "medium"),
         "reviewer": ("deepseek-v4-pro", "high"),
-        "cheap_reviewer": ("mimo-v2.5", "medium"),
         "resolver": ("glm-5.2", "xhigh"),
-        "resolver_crosscheck": ("deepseek-v4-pro", "xhigh"),
     }
+    assert set(roles) == set(approved)
     for role, (model, reasoning) in approved.items():
         assert roles[role]["primary"] == model, role
         assert roles[role].get("reasoning") == reasoning, role
@@ -109,19 +113,12 @@ def test_writer_and_reviewer_are_different_families():
     assert writer != reviewer
 
 
-def test_claude_is_a_fallback_and_never_a_primary():
-    config = _shipped()
-    primaries = {spec["primary"] for spec in config["roles"].values()}
-    assert "claude-sonnet-5" not in primaries
-    assert any("claude-sonnet-5" in (spec.get("fallbacks") or [])
-               for spec in config["roles"].values())
-
-
-def test_resolver_roles_refuse_rather_than_substitute():
-    roles = _shipped()["roles"]
-    for role in ("resolver", "resolver_crosscheck"):
-        assert roles[role]["allow_weaker_fallback"] is False, role
-        assert roles[role]["fallbacks"] == [], role
+def test_no_role_may_fall_back_to_anything():
+    """Every role fails closed. An unavailable primary is a refusal, not a swap."""
+    for role, spec in _shipped()["roles"].items():
+        assert spec["fallbacks"] == [], role
+        assert spec["allow_weaker_fallback"] is False, role
+        assert spec.get("allow_family_substitution", False) is False, role
 
 
 def test_every_escalation_target_is_a_defined_role():

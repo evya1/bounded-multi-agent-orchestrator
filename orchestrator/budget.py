@@ -25,9 +25,31 @@ from .errors import Reason, Refusal
 
 
 class CostSource(StrEnum):
-    REPORTED = "REPORTED"
-    ESTIMATED = "ESTIMATED"
-    FREE_LOCAL = "FREE_LOCAL"
+    """Where a dollar figure came from. Recorded on every row, never laundered.
+
+    ``provider_reported`` Pi returned per-call usage from the provider.
+    ``catalog_estimate``  we priced it locally from catalog metadata.
+    ``local_zero``        local inference: zero EXTERNAL API spend. This says
+                          nothing about the electricity or the GPU; it says this
+                          call put nothing on an OpenRouter invoice.
+    """
+
+    REPORTED = "provider_reported"
+    ESTIMATED = "catalog_estimate"
+    FREE_LOCAL = "local_zero"
+
+
+#: Values written by earlier versions of the ledger, so an existing file still
+#: totals correctly instead of silently reclassifying old spend as estimated.
+_LEGACY_SOURCES = {
+    "REPORTED": CostSource.REPORTED,
+    "ESTIMATED": CostSource.ESTIMATED,
+    "FREE_LOCAL": CostSource.FREE_LOCAL,
+}
+
+
+def normalise_source(value: str) -> str:
+    return str(_LEGACY_SOURCES.get(value, value))
 
 
 @dataclass
@@ -52,6 +74,11 @@ class LedgerEntry:
     duration_s: float = 0.0
     exit_code: int = 0
     note: str = ""
+    #: Run identity, so per-role and per-run budgets are computable from the
+    #: ledger alone rather than from something the caller remembers.
+    task_run_id: str = ""
+    worker_id: str = ""
+    reasoning_tokens: int = 0
 
     def as_dict(self) -> dict:
         return asdict(self)
@@ -146,7 +173,7 @@ class Ledger:
             status.by_role[entry.role] = status.by_role.get(entry.role, 0.0) + entry.cost_usd
             key = f"{entry.repo}/{entry.task_id}"
             status.by_task[key] = status.by_task.get(key, 0.0) + entry.cost_usd
-            if entry.cost_source == str(CostSource.REPORTED):
+            if normalise_source(entry.cost_source) == str(CostSource.REPORTED):
                 status.reported_usd += entry.cost_usd
             else:
                 status.estimated_usd += entry.cost_usd
@@ -174,6 +201,155 @@ class Ledger:
                 {"estimated_usd": estimated_usd, "spendable_usd": status.spendable_usd},
             )
         return None
+
+
+@dataclass(frozen=True)
+class Envelope:
+    """One soft/hard pair. Soft warns; hard forbids. Nothing escalates silently."""
+
+    label: str
+    soft_usd: float
+    hard_usd: float
+
+    def as_dict(self) -> dict:
+        return {"label": self.label, "soft_usd": self.soft_usd, "hard_usd": self.hard_usd}
+
+
+@dataclass
+class SpendVerdict:
+    """The answer to 'may this worker make one more paid generation?'"""
+
+    allowed: bool
+    refusal: Refusal | None = None
+    warnings: list[str] = field(default_factory=list)
+    checked: list[dict] = field(default_factory=list)
+
+    def as_dict(self) -> dict:
+        return {
+            "allowed": self.allowed,
+            "refusal": self.refusal.as_dict() if self.refusal else None,
+            "warnings": self.warnings,
+            "checked": self.checked,
+        }
+
+
+class RunBudget:
+    """Budgets as first-class state, at three scopes at once.
+
+    A worker, its role and the whole task run each carry an expected cost, a
+    soft budget and a hard budget. Before EVERY paid generation all three are
+    checked plus the daily cap, and the check asks the forward-looking question:
+    could ONE more call of this size cross a hard line? If yes, the call is not
+    made. There is no automatic expensive fallback and no hidden escalation —
+    the only way past a hard budget is a human raising it.
+    """
+
+    def __init__(self, ledger: Ledger, task_run_id: str, total: Envelope) -> None:
+        self.ledger = ledger
+        self.task_run_id = task_run_id
+        self.total = total
+        self.roles: dict[str, Envelope] = {}
+
+    def set_role(self, role: str, envelope: Envelope) -> None:
+        self.roles[role] = envelope
+
+    def spent_on_run(self) -> float:
+        return round(
+            sum(
+                entry.cost_usd
+                for entry in self.ledger.entries()
+                if entry.paid and entry.task_run_id == self.task_run_id
+            ),
+            6,
+        )
+
+    def spent_on_role(self, role: str) -> float:
+        return round(
+            sum(
+                entry.cost_usd
+                for entry in self.ledger.entries()
+                if entry.paid and entry.task_run_id == self.task_run_id and entry.role == role
+            ),
+            6,
+        )
+
+    def authorize_generation(
+        self, role: str, expected_usd: float, paid: bool = True, day: str | None = None
+    ) -> SpendVerdict:
+        """May one more paid generation of ``expected_usd`` be dispatched?"""
+        verdict = SpendVerdict(allowed=True)
+        if not paid:
+            verdict.checked.append({"scope": "local", "detail": "zero external API spend"})
+            return verdict
+
+        role_envelope = self.roles.get(role)
+        scopes: list[tuple[str, Envelope, float]] = []
+        if role_envelope is not None:
+            scopes.append((f"role:{role}", role_envelope, self.spent_on_role(role)))
+        scopes.append(("run", self.total, self.spent_on_run()))
+
+        for name, envelope, spent in scopes:
+            projected = spent + expected_usd
+            verdict.checked.append(
+                {
+                    "scope": name,
+                    "spent_usd": round(spent, 6),
+                    "expected_usd": round(expected_usd, 6),
+                    "projected_usd": round(projected, 6),
+                    "soft_usd": envelope.soft_usd,
+                    "hard_usd": envelope.hard_usd,
+                }
+            )
+            if envelope.hard_usd > 0 and projected > envelope.hard_usd:
+                verdict.allowed = False
+                verdict.refusal = Refusal(
+                    Reason.BUDGET_REFUSED,
+                    f"{name}: one more generation would take spend to "
+                    f"${projected:.4f}, past the HARD budget ${envelope.hard_usd:.4f}. "
+                    "No call was made. Raising a hard budget is a human decision.",
+                    {
+                        "scope": name,
+                        "spent_usd": spent,
+                        "expected_usd": expected_usd,
+                        "hard_usd": envelope.hard_usd,
+                    },
+                )
+                return verdict
+            if envelope.soft_usd > 0 and projected > envelope.soft_usd:
+                verdict.warnings.append(
+                    f"{name}: projected ${projected:.4f} is past the SOFT budget "
+                    f"${envelope.soft_usd:.4f} (proceeding; the hard budget is "
+                    f"${envelope.hard_usd:.4f})"
+                )
+
+        daily = self.ledger.authorize(True, expected_usd, day)
+        if daily is not None:
+            verdict.allowed = False
+            verdict.refusal = daily
+        return verdict
+
+    def as_dict(self) -> dict:
+        return {
+            "task_run_id": self.task_run_id,
+            "total": {**self.total.as_dict(), "spent_usd": self.spent_on_run()},
+            "roles": {
+                role: {**envelope.as_dict(), "spent_usd": self.spent_on_role(role)}
+                for role, envelope in sorted(self.roles.items())
+            },
+        }
+
+
+def envelopes_from_roles(roles_config: dict) -> dict[str, Envelope]:
+    """Read ``roles.<name>.limits.{soft_usd,hard_usd}`` into budget envelopes."""
+    envelopes: dict[str, Envelope] = {}
+    for role, spec in (roles_config or {}).items():
+        limits = (spec or {}).get("limits") or {}
+        envelopes[role] = Envelope(
+            label=role,
+            soft_usd=float(limits.get("soft_usd", 0.0) or 0.0),
+            hard_usd=float(limits.get("hard_usd", 0.0) or 0.0),
+        )
+    return envelopes
 
 
 def render_status(status: BudgetStatus) -> str:
