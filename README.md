@@ -181,9 +181,10 @@ flowchart TD
 Concretely, a model never: picks the next task, decides a gate is resolved,
 widens its own write set, declares its own verification passed, or creates an
 approval receipt. Model **roles** are configuration, not code (see
-[Model routing](#model-routing) for the full table): a local model is the
-default bounded implementer; stronger cloud models handle planning, review and
-rare escalation; the verifier has no model in its loop at all — it runs the
+[Model routing](#model-routing) for the full table): a mid-cost model is the
+default bounded writer, an independent model of a different family reviews it,
+a cheap model absorbs reconnaissance, and stronger reasoning is reserved for
+genuine conflicts; the verifier has no model in its loop at all — it runs the
 task's declared commands and reads their exit codes.
 
 ## Current project phase
@@ -410,16 +411,36 @@ Routing is configuration (`config/models.example.yaml`, overridden by
 `config/models.yaml`), not code. Python decides which *role* a stage needs;
 YAML decides which model serves that role.
 
-| role | model | tier |
-|---|---|---|
-| local executor | local Qwen3.6 (llama.cpp) | local / free |
-| value reasoner | `deepseek/deepseek-v4-pro` | OpenRouter / paid |
-| frontier code reviewer | `openai/gpt-5.3-codex` | OpenRouter / paid |
-| frontier reasoner | `openai/gpt-5.4` | OpenRouter / paid |
-| adversarial architect | `anthropic/claude-opus-4.8` | OpenRouter / rare escalation |
+| role | model | reasoning | used for |
+|---|---|---|---|
+| scout | `deepseek/deepseek-v4-flash-0731` | medium | reconnaissance, classification, first-pass diff reading |
+| writer | `z-ai/glm-5.2` | high | implementation, documentation, multi-file changes, tests |
+| reviewer | `deepseek/deepseek-v4-pro` | high | independent code, documentation and requirement review |
+| cheap reviewer | `xiaomi/mimo-v2.5` | medium | second opinion where a full review is not justified |
+| resolver | `z-ai/glm-5.2` | xhigh | genuine requirements or architecture conflicts |
+| resolver cross-check | `deepseek/deepseek-v4-pro` | xhigh | independent cross-check of a material resolver decision |
+| fallback | `anthropic/claude-sonnet-5` | — | optional only; wired to no stage as a primary |
+| local executor | local Qwen3.6 (llama.cpp) | — | not routed by default — `model_id` is still UNDISCOVERED |
 
 Escalation maps `(complexity, stage) -> role`; complexity defaults to the task's
-`risk` and can be overridden with `--complexity` or a specific `--model`.
+`risk` and can be overridden with `--complexity` or a specific `--model`. The
+escalation order is deterministic tool, then scout, then writer, then reviewer,
+then resolver, then cross-check — escalate only when the cheaper step cannot
+answer the question.
+
+`reasoning` is a **role** property, not a model property: the same model serves
+the writer at `high` and the resolver at `xhigh`. It maps to Pi's normalized
+`--thinking` scale (`off|minimal|low|medium|high|xhigh|max`), and the router
+drops a level it does not recognise rather than forwarding an invented provider
+parameter. Every model and level in the table was checked against the live
+provider catalog and accepted before being recorded. One operational limit is
+worth knowing: `z-ai/glm-5.2` advertises a 262K context with a 4.1K maximum
+output, so the writer role should be given bounded single-task work rather than
+asked to emit one very large diff.
+
+Writer and reviewer are deliberately different model families, and a test
+asserts it. `anthropic/claude-sonnet-5` is a fallback only — it is the primary
+for no role, and a test asserts that too.
 
 Availability is verified at runtime against Pi's local non-secret model catalog
 and, for the local provider, an HTTP probe. A frontier reviewer is **never**

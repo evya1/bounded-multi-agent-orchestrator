@@ -40,6 +40,10 @@ class ModelChoice:
     price: dict
     substituted_for: str | None = None
     privileges: dict = field(default_factory=dict)
+    #: Pi's normalized --thinking level for this ROLE, or None for the
+    #: provider default. A role property, not a model property: one model
+    #: serves the writer at `high` and the resolver at `xhigh`.
+    reasoning: str | None = None
 
     @property
     def label(self) -> str:
@@ -58,6 +62,7 @@ class ModelChoice:
             "price_usd_per_mtok": self.price,
             "substituted_for": self.substituted_for,
             "privileges": self.privileges,
+            "reasoning": self.reasoning,
         }
 
 
@@ -172,6 +177,19 @@ class ModelRouter:
     def role_for(self, stage: str, complexity: str) -> str | None:
         return (self.escalation.get(complexity) or {}).get(stage)
 
+    REASONING_LEVELS = ("off", "minimal", "low", "medium", "high", "xhigh", "max")
+
+    def _reasoning_for(self, role: str) -> str | None:
+        """The role's declared reasoning level, validated against Pi's scale.
+
+        An unknown level is dropped rather than passed through: fabricating a
+        provider parameter is worse than running at the provider default.
+        """
+        level = (self.roles.get(role) or {}).get("reasoning")
+        if level is None:
+            return None
+        return str(level) if str(level) in self.REASONING_LEVELS else None
+
     def _choice(self, role: str, model_name: str, stage: str, substituted_for: str | None) -> ModelChoice:
         model = self.models[model_name]
         provider_name = model.get("provider", "")
@@ -188,6 +206,7 @@ class ModelRouter:
             price=dict(model.get("cost_usd_per_mtok") or {}),
             substituted_for=substituted_for,
             privileges=dict(self.privileges.get(stage) or {}),
+            reasoning=self._reasoning_for(role),
         )
 
     def resolve(

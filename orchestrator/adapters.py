@@ -126,6 +126,10 @@ class PiAdapter(Adapter):
             "--model",
             choice.model_id or "",
         ]
+        # Pi exposes a normalized reasoning scale; the router only ever hands us
+        # a level from it, so nothing provider-specific is fabricated here.
+        if choice.reasoning:
+            argv += ["--thinking", choice.reasoning]
         privileges = choice.privileges or {}
         tools = privileges.get("tools", "none")
         if tools == "none":
