@@ -7,6 +7,7 @@ violations, stale bases, forced pushes) can be exercised safely.
 
 from __future__ import annotations
 
+import copy
 import subprocess
 import textwrap
 from pathlib import Path
@@ -196,12 +197,14 @@ def build_repo(root: Path, name: str, tasks: dict[str, str] | None = None) -> Pa
 MODELS_CONFIG = {
     "adapters": {"fake": {"enabled": True}},
     "providers": {
-        "local": {"kind": "local", "paid": False, "pi_provider": "llama.cpp", "model_id": "qwen-local",
+        "local": {"kind": "local", "paid": False, "pi_provider": "local-llama",
                   "base_url_env": "FIXTURE_LOCAL_URL", "default_base_url": ""},
         "cloud": {"kind": "cloud", "paid": True, "pi_provider": "openrouter", "api_key_env": "FIXTURE_KEY"},
     },
     "models": {
-        "local-qwen": {"provider": "local", "family": "qwen", "cost_usd_per_mtok": {"input": 0.0, "output": 0.0}},
+        "local-qwen": {"provider": "local", "id": "qwen-local", "family": "qwen",
+                       "base_url_env": "FIXTURE_LOCAL_URL",
+                       "cost_usd_per_mtok": {"input": 0.0, "output": 0.0}},
         "cheap-cloud": {"provider": "cloud", "id": "vendor/cheap", "family": "deepseek",
                         "cost_usd_per_mtok": {"input": 1.0, "output": 2.0}},
         "frontier": {"provider": "cloud", "id": "vendor/frontier", "family": "openai",
@@ -211,7 +214,8 @@ MODELS_CONFIG = {
     },
     "roles": {
         "local_executor": {"primary": "local-qwen", "fallbacks": [], "allow_weaker_fallback": False},
-        "value_reasoner": {"primary": "cheap-cloud", "fallbacks": ["frontier"], "allow_weaker_fallback": True},
+        "value_reasoner": {"primary": "cheap-cloud", "fallbacks": ["frontier"],
+                           "allow_weaker_fallback": True, "allow_family_substitution": True},
         "code_reviewer": {"primary": "frontier", "fallbacks": [], "allow_weaker_fallback": False},
         "strict_absent": {"primary": "absent", "fallbacks": ["cheap-cloud"], "allow_weaker_fallback": False},
     },
@@ -258,5 +262,7 @@ def config(workspace: Path, repos: dict[str, Path]) -> Config:
         review_policy=REVIEW_POLICY,
         resources=RESOURCES,
         budget=BudgetConfig(),
-        models=MODELS_CONFIG,
+        # A COPY: several tests mutate the routing table, and a shared module
+        # level dict would leak those mutations into every later test.
+        models=copy.deepcopy(MODELS_CONFIG),
     )

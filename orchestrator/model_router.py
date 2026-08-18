@@ -17,7 +17,8 @@ import json
 import os
 import urllib.error
 import urllib.request
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from enum import StrEnum
 from pathlib import Path
 
 from .errors import Reason, Refusal
@@ -66,6 +67,25 @@ class ModelChoice:
         }
 
 
+class Presence(StrEnum):
+    """Three genuinely different things, which the old boolean conflated.
+
+    ``CONFIGURED``    this orchestrator's routing table names the model;
+    ``REGISTERED``    the runtime (Pi's catalog, or the local provider
+                      extension) knows the model exists;
+    ``AVAILABLE_NOW`` a health check just succeeded, so work may be sent to it.
+
+    A local model whose GPU server is stopped is REGISTERED and NOT available.
+    Treating registration as availability is exactly how work gets dispatched
+    into a connection refused.
+    """
+
+    UNCONFIGURED = "UNCONFIGURED"
+    CONFIGURED = "CONFIGURED"
+    REGISTERED = "REGISTERED"
+    AVAILABLE_NOW = "AVAILABLE_NOW"
+
+
 @dataclass
 class Availability:
     """Whether one configured model can actually be reached right now."""
@@ -73,9 +93,15 @@ class Availability:
     name: str
     available: bool
     detail: str
+    presence: str = str(Presence.UNCONFIGURED)
 
     def as_dict(self) -> dict:
-        return {"model": self.name, "available": self.available, "detail": self.detail}
+        return {
+            "model": self.name,
+            "available": self.available,
+            "detail": self.detail,
+            "presence": self.presence,
+        }
 
 
 def _load_catalog(path: str | Path) -> dict[str, dict]:
@@ -133,44 +159,92 @@ class ModelRouter:
             return None
         return bool(self.environ.get(env_name))
 
+    def base_url_for(self, model_name: str) -> str:
+        """The health-check endpoint for one local model.
+
+        Each local model is served by its OWN llama.cpp process on its own port,
+        so the URL belongs to the MODEL, not to the provider. A provider-level
+        URL would report the one running server as proof that all four are up.
+        """
+        model = self.models.get(model_name) or {}
+        provider = self.providers.get(model.get("provider", "")) or {}
+        override = model.get("base_url_env") or provider.get("base_url_env") or ""
+        if override and self.environ.get(override):
+            return str(self.environ[override])
+        return str(model.get("base_url") or provider.get("default_base_url") or "")
+
     def availability(self, model_name: str) -> Availability:
-        """Can this model be reached, without spending anything to find out?"""
+        """Can this model be reached, without spending anything to find out?
+
+        Nothing here makes a paid call. Cloud availability is read from Pi's
+        local non-secret catalog plus credential presence; local availability is
+        an unauthenticated HTTP probe of the model's own server.
+        """
         model = self.models.get(model_name)
         if model is None:
-            return Availability(model_name, False, "not defined in the routing table")
+            return Availability(
+                model_name, False, "not defined in the routing table", str(Presence.UNCONFIGURED)
+            )
         provider_name = model.get("provider", "")
         provider = self.providers.get(provider_name) or {}
 
         if provider.get("kind") == "local":
-            model_id = provider.get("model_id")
+            model_id = model.get("id")
             if not model_id:
-                candidates = provider.get("discovered_candidates") or []
                 return Availability(
                     model_name,
                     False,
-                    "local provider model_id is UNDISCOVERED; "
-                    f"{len(candidates)} candidate local model(s) found but none chosen — "
-                    "a human must set providers.%s.model_id" % provider_name,
+                    f"{model_name}: no local model id configured",
+                    str(Presence.CONFIGURED),
                 )
-            base_url = self.environ.get(provider.get("base_url_env", ""), "") or provider.get(
-                "default_base_url", ""
-            )
+            base_url = self.base_url_for(model_name)
             if not base_url:
-                return Availability(model_name, False, "no local base URL configured")
+                return Availability(
+                    model_name,
+                    False,
+                    f"{model_id}: registered but no base URL configured",
+                    str(Presence.REGISTERED),
+                )
             ok, detail = _probe_http(base_url.rstrip("/") + "/v1/models")
-            return Availability(model_name, ok, f"{base_url}: {detail}")
+            if ok:
+                return Availability(
+                    model_name,
+                    True,
+                    f"{model_id} @ {base_url}: {detail}",
+                    str(Presence.AVAILABLE_NOW),
+                )
+            # REGISTERED in Pi, but its server is not answering. Registration is
+            # not availability, and this is the exact case that must not route.
+            return Availability(
+                model_name,
+                False,
+                f"{model_id} @ {base_url}: SERVER OFFLINE ({detail}) — registered in Pi but "
+                "not running; start it externally, this orchestrator does not manage GPU servers",
+                str(Presence.REGISTERED),
+            )
 
         if not self.key_available(provider_name):
             return Availability(
-                model_name, False, f"{provider_name}: credentials not configured"
+                model_name,
+                False,
+                f"{provider_name}: credentials not configured",
+                str(Presence.CONFIGURED),
             )
         model_id = model.get("id")
         catalog = self.catalog()
         if catalog and model_id not in catalog:
             return Availability(
-                model_name, False, f"{model_id}: absent from the {provider_name} catalog"
+                model_name,
+                False,
+                f"{model_id}: absent from the {provider_name} catalog",
+                str(Presence.CONFIGURED),
             )
-        return Availability(model_name, True, f"{model_id}: present in the {provider_name} catalog")
+        return Availability(
+            model_name,
+            True,
+            f"{model_id}: present in the {provider_name} catalog",
+            str(Presence.AVAILABLE_NOW),
+        )
 
     # ------------------------------------------------------------ resolution
 
@@ -265,7 +339,17 @@ class ModelRouter:
                 )
             ], notes
 
+        primary_family = str((self.models.get(primary) or {}).get("family", "unknown"))
         for fallback in spec.get("fallbacks") or []:
+            fallback_family = str((self.models.get(fallback) or {}).get("family", "unknown"))
+            if fallback_family != primary_family and not spec.get("allow_family_substitution", False):
+                # A different family is a different reviewer, a different price
+                # and a different failure mode. It is never an automatic choice.
+                notes.append(
+                    f"fallback {fallback} REFUSED: family {fallback_family!r} != primary family "
+                    f"{primary_family!r} and allow_family_substitution is not set"
+                )
+                continue
             fallback_check = self.availability(fallback)
             if fallback_check.available:
                 notes.append(f"SUBSTITUTED {primary} -> {fallback}")
@@ -279,6 +363,33 @@ class ModelRouter:
                 {"role": role, "notes": notes},
             )
         ], notes
+
+    # ---------------------------------------------------------- role budgets
+
+    def limits_for(self, role: str):
+        """The bounded-run limits for one role, from ``roles.<role>.limits``.
+
+        Imported lazily: ``pi_rpc`` owns the limit dataclass, and the router must
+        not become the place where limits are also *defined*.
+        """
+        from .pi_rpc import RoleLimits
+
+        spec = (self.roles.get(role) or {}).get("limits")
+        limits = RoleLimits.from_config(spec)
+        primary = (self.roles.get(role) or {}).get("primary")
+        model = self.models.get(str(primary)) or {}
+        provider = self.providers.get(str(model.get("provider", ""))) or {}
+        if not provider.get("paid", True):
+            # A local model's EXTERNAL API ceiling is zero by construction. Its
+            # turn, tool, wall-time and retry limits are what actually bound it.
+            limits = replace(limits, soft_usd=0.0, hard_usd=0.0)
+        return limits
+
+    def is_paid(self, role: str) -> bool:
+        primary = (self.roles.get(role) or {}).get("primary")
+        model = self.models.get(str(primary)) or {}
+        provider = self.providers.get(str(model.get("provider", ""))) or {}
+        return bool(provider.get("paid", True))
 
     # ------------------------------------------------------------- diversity
 
@@ -300,3 +411,104 @@ class ModelRouter:
             f"{next(iter(families.values()))!r} family — this review is not independent",
             {"families": families},
         )
+
+
+# --------------------------------------------------------- no-Claude guarantee
+
+#: Every spelling of "this is an Anthropic model" that could appear in a routing
+#: table. Matched case-insensitively against the model name, its provider slug
+#: and its declared family.
+CLAUDE_MARKERS = ("anthropic", "claude", "opus", "sonnet", "haiku", "fable")
+
+#: Every place a runtime route can hide. `resolve` reads all of them, so the
+#: validator must too — a Claude model reachable only through an unknown-role
+#: default would still be a runtime Claude route.
+ROUTE_KEYS = ("primary", "fallbacks", "default", "default_model", "on_unavailable")
+
+
+def _looks_anthropic(*values: object) -> bool:
+    for value in values:
+        text = str(value or "").lower()
+        if any(marker in text for marker in CLAUDE_MARKERS):
+            return True
+    return False
+
+
+def claude_runtime_routes(models_config: dict) -> list[Refusal]:
+    """Every ACTIVE runtime route that could reach an Anthropic/Claude model.
+
+    This is a configuration-validation function, not a text search. It reports
+    only routes the runtime could actually take:
+
+    * a model definition an enabled role points at;
+    * a role primary, a role fallback, or any role-level default;
+    * an enabled adapter whose executable is the Claude CLI.
+
+    Documentation, comments and historical notes that merely MENTION Claude are
+    deliberately not findings. The requirement is that no active route exists,
+    not that the word is unspeakable.
+    """
+    refusals: list[Refusal] = []
+    models = models_config.get("models") or {}
+    providers = models_config.get("providers") or {}
+    roles = models_config.get("roles") or {}
+
+    def flag(where: str, model_name: str, model_spec: dict) -> None:
+        refusals.append(
+            Refusal(
+                Reason.CONFIG_INVALID,
+                f"{where}: {model_name!r} routes to an Anthropic/Claude model "
+                f"(id={model_spec.get('id')!r}, family={model_spec.get('family')!r}); "
+                "this orchestrator has no Claude runtime route by design",
+                {"where": where, "model": model_name, "id": model_spec.get("id")},
+            )
+        )
+
+    def anthropic_model(model_name: str) -> dict | None:
+        spec = models.get(model_name)
+        if spec is None:
+            return None
+        provider = providers.get(str(spec.get("provider", ""))) or {}
+        if _looks_anthropic(
+            model_name, spec.get("id"), spec.get("family"), provider.get("pi_provider")
+        ):
+            return spec
+        return None
+
+    for role_name, role_spec in roles.items():
+        if not isinstance(role_spec, dict):
+            continue
+        for key in ROUTE_KEYS:
+            value = role_spec.get(key)
+            targets = value if isinstance(value, list) else ([value] if value else [])
+            for target in targets:
+                spec = anthropic_model(str(target))
+                if spec is not None:
+                    flag(f"roles.{role_name}.{key}", str(target), spec)
+
+    for key in ROUTE_KEYS:
+        value = models_config.get(key)
+        targets = value if isinstance(value, list) else ([value] if value else [])
+        for target in targets:
+            spec = anthropic_model(str(target))
+            if spec is not None:
+                flag(f"models.{key}", str(target), spec)
+
+    for adapter_name, adapter_spec in (models_config.get("adapters") or {}).items():
+        if not isinstance(adapter_spec, dict) or not adapter_spec.get("enabled", False):
+            continue
+        if _looks_anthropic(adapter_name, adapter_spec.get("executable")):
+            refusals.append(
+                Refusal(
+                    Reason.CONFIG_INVALID,
+                    f"adapters.{adapter_name} is ENABLED and executes "
+                    f"{adapter_spec.get('executable')!r}; Claude may not be a runtime worker",
+                    {"adapter": adapter_name},
+                )
+            )
+    return refusals
+
+
+def validate_no_claude_runtime(models_config: dict) -> list[Refusal]:
+    """Raise-free assertion that the active configuration cannot route to Claude."""
+    return claude_runtime_routes(models_config)

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from .context_compiler import ContextManifest
 from .task_loader import Task
+from .worker_result import REVIEWER_RESULT_CONTRACT, WORKER_RESULT_CONTRACT
 
 STOP_CONTRACT = """\
 ## Stop-and-escalate contract (binding)
@@ -69,6 +70,50 @@ those itself and decides whether they passed. Your job is to edit; proving the
 code works is not delegated to you.
 
 If a plan step is ambiguous, stop rather than guess.""",
+    "scout": """\
+## Your role: SCOUT (read-only)
+
+You have NO tools. Write no code and edit no file.
+
+Answer the specific question you were asked, from the context supplied, in as
+few words as it takes. You are the cheap first pass: your job is to save a more
+expensive model from being called at all, not to do its work.
+
+If the context does not contain the answer, say so plainly. A confident guess
+from a scout is worse than no scout.""",
+    "fix": """\
+## Your role: FIXER (bounded correction, exactly one cycle)
+
+You are repairing ONE specific, already-diagnosed failure. The exact failure
+output is below; it came from a real command run by the orchestrator, not from
+anyone's opinion.
+
+Make the SMALLEST change that fixes that failure. Do not refactor, do not
+improve unrelated code, do not add features, do not rewrite tests so they pass.
+If the correct fix would need a design decision or a change outside the declared
+write set, stop instead.
+
+You may edit ONLY the files in the declared write set. You have no shell. Do NOT
+run tests — the orchestrator runs them and decides whether they passed.
+
+This is the only correction cycle. There is no second one.""",
+    "resolve": """\
+## Your role: RESOLVER (read-only, single response)
+
+You have NO tools. Write no code and edit no file. You are being consulted
+because an implementer and an independent reviewer disagree about something
+material: an architectural choice, or what a requirement actually demands.
+
+You are NOT here to re-review the code, to add findings of your own, or to
+adjudicate style. Answer only the disagreement put to you:
+
+  1. state which position the authoritative requirements support, and quote the
+     specific text that decides it;
+  2. if the requirements genuinely do not decide it, say so — that outcome is a
+     question for a human, and pretending otherwise invents a requirement;
+  3. give the smallest change that implements your answer.
+
+You are consulted once. Be decisive or be honest that it is undecidable.""",
     "review": """\
 ## Your role: REVIEWER (read-only)
 
@@ -82,9 +127,20 @@ requirement ID in `implements`. Report:
   3. tests that assert nothing meaningful;
   4. anything written outside the declared write set.
 
-End your response with exactly one line: APPROVE or REJECT.
-
 Your verdict is advice to a human, not an approval. It does not ship anything.""",
+}
+
+#: Which structured result contract each stage must satisfy. The block is the
+#: worker's SEMANTIC report. It has no bearing on process lifecycle: a settled
+#: worker is settled whether or not it emitted one, and a worker that emits one
+#: early is not finished. See ``pi_rpc`` for what actually ends a run.
+_RESULT_CONTRACTS = {
+    "scout": WORKER_RESULT_CONTRACT,
+    "plan": WORKER_RESULT_CONTRACT,
+    "implement": WORKER_RESULT_CONTRACT,
+    "fix": WORKER_RESULT_CONTRACT,
+    "review": REVIEWER_RESULT_CONTRACT,
+    "resolve": REVIEWER_RESULT_CONTRACT,
 }
 
 
@@ -100,6 +156,7 @@ def build_prompt(
     manifest: ContextManifest,
     plan: str | None = None,
     change_summary: str | None = None,
+    failure_output: str | None = None,
 ) -> str:
     """Assemble the full bounded prompt for one stage."""
     if stage not in _ROLE_RULES:
@@ -126,6 +183,21 @@ def build_prompt(
         sections += ["", "# Approved plan (follow literally)", "", plan]
     if change_summary:
         sections += ["", "# Change under review", "", change_summary]
+    if failure_output:
+        sections += [
+            "",
+            "# The exact failure you must fix",
+            "",
+            "This is verbatim output from a command the orchestrator ran. It is not an",
+            "opinion and it is not negotiable.",
+            "",
+            "```",
+            failure_output,
+            "```",
+        ]
+    contract = _RESULT_CONTRACTS.get(stage)
+    if contract:
+        sections += ["", contract]
     return "\n".join(sections)
 
 

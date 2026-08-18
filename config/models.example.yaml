@@ -3,58 +3,48 @@
 # Copy to config/models.yaml to change routing without touching Python. The
 # loader prefers models.yaml and falls back to this file.
 #
-# Cost figures are catalog metadata (USD per million tokens) read from Pi's
-# non-secret model store. They are ESTIMATES for pre-call budgeting. Actual
-# spend is taken from Pi's reported per-call usage where available.
+# NO CLAUDE. NO ANTHROPIC. Not as a primary, not as a fallback, not as an
+# unknown-role default, not as an enabled adapter. `validate_no_claude_runtime`
+# in orchestrator/model_router.py enforces this and a test asserts it.
+#
+# Prices below are USD per MILLION tokens and were verified LIVE against
+# https://openrouter.ai/api/v1/models on 2026-08-18. They are estimates used for
+# PRE-CALL budgeting. Actual spend is taken from Pi's provider-reported per-call
+# usage whenever the provider supplies it (cost_source: provider_reported).
 
 adapters:
   pi:
     executable: pi
-    # Discovered from the installed Pi build (0.84.2):
-    #   -p / --print       non-interactive
-    #   --mode json        JSON event stream on stdout (carries usage + cost)
+    # Verified against the installed Pi 0.84.2 (`pi --help`, docs/rpc.md):
+    #   --mode rpc         JSONL protocol over stdin/stdout  <- the runtime path
+    #   --mode json        one-shot event stream on stdout   <- legacy print path
     #   --provider/--model provider and model selection
-    #   -nt / --no-tools   no tools at all (planner / reviewer)
-    #   -t / --tools       strict allowlist for built-in AND extension tools
-    #   -xt/--exclude-tools denylist
+    #   -nt / --no-tools   no tools at all (reviewer / resolver / scout)
+    #   -t  / --tools      strict allowlist for built-in AND extension tools
     #   --thinking <level> off|minimal|low|medium|high|xhigh|max
-    print_flag: "-p"
+    #   --no-extensions    disable discovery; explicit `-e` still applies
+    rpc_mode_flag: ["--mode", "rpc"]
     json_mode_flag: ["--mode", "json"]
+    print_flag: "-p"
     enabled: true
-  claude:
-    executable: claude
-    enabled: false          # separate adapter; off by default
+  # The Claude CLI adapter is REMOVED, not merely disabled. Claude is not a
+  # runtime worker, reviewer, resolver or fallback in this control plane.
 
 providers:
-  # ---------------------------------------------------------------- local/free
-  llama_cpp:
+  # ------------------------------------------------------- local GPU / free
+  local_llama:
     kind: local
     paid: false
-    # Pi talks to a llama.cpp ROUTER server (llama-server started WITHOUT -m).
-    # Configured through LLAMA_BASE_URL / LLAMA_API_KEY or `/login llama.cpp`.
-    pi_provider: llama.cpp
-    base_url_env: LLAMA_BASE_URL
-    default_base_url: http://127.0.0.1:8080
-    # NOT SET DELIBERATELY. Two local Qwen GGUFs exist on this machine and the
-    # router was not running at discovery time, so the exact router-side model
-    # ID could not be observed. `doctor` reports this as UNDISCOVERED and the
-    # router REFUSES local execution until a human fills this in.
-    model_id: null
-    discovered_candidates:
-      - file: /root/local-agent-stack/models/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf
-        label: "Qwen3.6 35B-A3B UD-Q4_K_M (the user's 'Qwen3.6')"
-        tool_use: true
-        reasoning: true        # emits reasoning_content before tool calls
-        context: 65536
-        note: "RUNBOOK serves this single-model on port 8091, not router mode."
-      - file: /root/local-agent-stack/models/Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf
-        label: "Qwen3-Coder 30B-A3B Q4_K_M"
-        tool_use: true
-        reasoning: false
-        context: 65536
-        note: "RUNBOOK serves this single-model on port 8090, not router mode."
+    # Registered in Pi by an extension that declares the provider and its four
+    # models. The extension resolves its own credential from the environment;
+    # this orchestrator never reads, stores or prints it.
+    pi_provider: local-llama
+    # `--no-extensions` is passed to every bounded worker, so the local provider
+    # extension must be named explicitly for a local run to resolve its model.
+    pi_extension: /root/.pi/local-llama-ext.js
+    api_key_env: LOCAL_LLAMA_KEY      # presence only; value never read here
 
-  # --------------------------------------------------------- OpenRouter / paid
+  # ------------------------------------------------------ OpenRouter / paid
   openrouter:
     kind: cloud
     paid: true
@@ -62,144 +52,288 @@ providers:
     api_key_env: OPENROUTER_API_KEY
     catalog: /root/.pi/agent/models-store.json   # non-secret; carries cost metadata
 
-# Model definitions. `family` drives the diversity policy: an important review
-# should not come from the same family that wrote the code.
+# ---------------------------------------------------------------- the models
 #
-# Cost figures are catalog metadata read from Pi's non-secret model store
-# (USD per million tokens), recorded 2026-08-17. They are estimates for
-# pre-call budgeting, never an invoice.
+# `family` drives the diversity policy: a review must not come from the family
+# that wrote the code.
+#
+# LOCAL MODELS: being listed here means CONFIGURED. Being in Pi's extension
+# means REGISTERED. Neither means AVAILABLE. Availability is a live probe of
+# `base_url` (see ModelRouter.availability / Presence), and `doctor` reports the
+# three states separately. This orchestrator never starts or stops a GPU server.
 models:
-  local-qwen36:
-    provider: llama_cpp
+  qwen3.8-27b:
+    provider: local_llama
+    id: qwen3.8-27b
     family: qwen
+    base_url: http://127.0.0.1:8093
+    base_url_env: LOCAL_LLAMA_QWEN38_URL
+    context: 65536
+    reasoning_capable: true
     cost_usd_per_mtok: {input: 0.0, output: 0.0}
+
+  qwen3.6-35b:
+    provider: local_llama
+    id: qwen3.6-35b
+    family: qwen
+    base_url: http://127.0.0.1:8091
+    base_url_env: LOCAL_LLAMA_URL
+    context: 65536
+    reasoning_capable: false
+    cost_usd_per_mtok: {input: 0.0, output: 0.0}
+
+  qwen3-coder-30b:
+    provider: local_llama
+    id: qwen3-coder-30b
+    family: qwen
+    base_url: http://127.0.0.1:8090
+    base_url_env: LOCAL_LLAMA_CODER_URL
+    context: 32768          # as registered in the Pi extension, not 65K
+    reasoning_capable: false
+    cost_usd_per_mtok: {input: 0.0, output: 0.0}
+
+  kat-coder-v2.5-dev:
+    provider: local_llama
+    id: kat-coder-v2.5-dev
+    family: kat
+    base_url: http://127.0.0.1:8092
+    base_url_env: LOCAL_LLAMA_KAT_URL
+    context: 65536
+    reasoning_capable: false
+    cost_usd_per_mtok: {input: 0.0, output: 0.0}
+
+  # ------------------------------------------------------------- OpenRouter
   deepseek-v4-flash:
     provider: openrouter
     id: deepseek/deepseek-v4-flash-0731
     family: deepseek
+    context: 1310720
+    reasoning_capable: true
+    tool_capable: true
     cost_usd_per_mtok: {input: 0.14, output: 0.28, cache_read: 0.028}
+
+  gemini-3.7-flash:
+    provider: openrouter
+    id: google/gemini-3.7-flash
+    family: google
+    context: 1048576
+    reasoning_capable: true
+    tool_capable: true
+    cost_usd_per_mtok: {input: 0.375, output: 1.875, cache_read: 0.0375}
+
+  deepseek-v4-pro:
+    provider: openrouter
+    id: deepseek/deepseek-v4-pro-0813
+    family: deepseek
+    context: 1048576
+    reasoning_capable: true
+    tool_capable: true
+    cost_usd_per_mtok: {input: 0.66, output: 1.98, cache_read: 0.022}
+
   glm-5.2:
     provider: openrouter
     id: z-ai/glm-5.2
     family: zai
-    # 262K context and a 4.1K maximum output: give this role bounded,
-    # single-task work rather than one very large diff.
-    cost_usd_per_mtok: {input: 0.63, output: 1.98, cache_read: 0.0945}
-  deepseek-v4-pro:
-    provider: openrouter
-    id: deepseek/deepseek-v4-pro
-    family: deepseek
-    cost_usd_per_mtok: {input: 1.168, output: 2.336, cache_read: 0.09855}
-  mimo-v2.5:
-    provider: openrouter
-    id: xiaomi/mimo-v2.5
-    family: xiaomi
-    cost_usd_per_mtok: {input: 0.14, output: 0.28, cache_read: 0.0028}
-  claude-sonnet-5:
-    provider: openrouter
-    id: anthropic/claude-sonnet-5
-    family: anthropic
-    cost_usd_per_mtok: {input: 2.0, output: 10.0, cache_read: 0.2, cache_write: 2.5}
+    context: 1048576
+    reasoning_capable: true
+    tool_capable: true
+    cost_usd_per_mtok: {input: 0.49, output: 1.54, cache_read: 0.091}
 
-# Role -> intended model. `fallbacks` are tried in order only when the primary
-# is unavailable, and the router ALWAYS reports the substitution. A role that
-# must not be downgraded sets `allow_weaker_fallback: false` and refuses.
+# ------------------------------------------------------------------- roles
 #
-# `reasoning` is optional and maps to Pi's normalized --thinking scale
-# (off|minimal|low|medium|high|xhigh|max). It belongs to the ROLE, not the
-# model: the same model serves the writer at `high` and the resolver at
-# `xhigh`. Omit the key to leave a model at its provider default. Every level
-# below was checked against its model on 2026-08-17 and accepted.
+# `fallbacks: []` everywhere is deliberate. An unavailable primary FAILS CLOSED.
+# There is no automatic substitution, no silent family swap and no automatic
+# escalation to a more expensive model. If a fallback is ever added, a
+# cross-family one additionally requires `allow_family_substitution: true`.
+#
+# `limits` are enforced by orchestrator/pi_rpc.py on the live worker process:
+# turns, tool calls, wall clock, inactivity and BOTH budget lines.
+#
+# hard_usd figures below are derived from the live prices above assuming a
+# bounded context packet of roughly 30-80K input tokens per call. Local roles
+# carry hard_usd: 0.0 — zero EXTERNAL API spend — and are bounded instead by
+# their turn, tool, wall-time and retry limits.
 roles:
   scout:
-    description: Cheap reconnaissance, classification, and first-pass diff reading.
+    description: Cheap reconnaissance, classification, first-pass reading. Local first.
+    primary: qwen3.8-27b
+    reasoning: medium
+    fallbacks: []
+    allow_weaker_fallback: false
+    limits:
+      max_model_calls: 2
+      max_tool_calls: 4
+      wall_seconds: 180
+      inactivity_seconds: 90
+      max_retries: 1
+      soft_usd: 0.0
+      hard_usd: 0.0
+
+  scout_remote:
+    description: >-
+      Remote scout. Reachable only when a run explicitly selects it; local
+      availability is not a permission to leave the local tier, and remote
+      availability is not a permission to leave it either.
     primary: deepseek-v4-flash
     reasoning: medium
-    fallbacks: [claude-sonnet-5]
-    allow_weaker_fallback: true
+    fallbacks: []
+    allow_weaker_fallback: false
+    limits:
+      max_model_calls: 2
+      max_tool_calls: 4
+      wall_seconds: 240
+      inactivity_seconds: 120
+      max_retries: 1
+      soft_usd: 0.02
+      hard_usd: 0.04
+
   writer:
     description: Default serious implementation and documentation work.
-    primary: glm-5.2
+    primary: gemini-3.7-flash
     reasoning: high
-    fallbacks: [claude-sonnet-5]
-    allow_weaker_fallback: true
-  reviewer:
-    description: Independent review. A different family from the writer by design.
-    primary: deepseek-v4-pro
-    reasoning: high
-    fallbacks: [claude-sonnet-5]
-    allow_weaker_fallback: true
-  cheap_reviewer:
-    description: Second opinion where a full high-cost review is not justified.
-    primary: mimo-v2.5
-    reasoning: medium
-    fallbacks: [claude-sonnet-5]
-    allow_weaker_fallback: true
-  resolver:
-    description: Genuine requirements or architecture conflicts only. Never routine work.
-    primary: glm-5.2
-    reasoning: xhigh
     fallbacks: []
     allow_weaker_fallback: false
-  resolver_crosscheck:
-    description: Independent cross-check of a material resolver decision. Not automatic.
-    primary: deepseek-v4-pro
-    reasoning: xhigh
-    fallbacks: []
-    allow_weaker_fallback: false
-  local_executor:
+    limits:
+      max_model_calls: 6
+      max_tool_calls: 12
+      wall_seconds: 720
+      inactivity_seconds: 240
+      max_retries: 1
+      soft_usd: 0.20
+      hard_usd: 0.40
+
+  writer_local:
     description: >-
-      Bounded routine implementation on a local model. Not routed by default:
-      providers.llama_cpp.model_id is still UNDISCOVERED, so the router refuses
-      it. Kept so a human can route work here once that is filled in.
-    primary: local-qwen36
+      Optional local implementation tier. NOT a fallback and never routed
+      automatically: a run must select it, and its server must actually answer.
+    primary: qwen3-coder-30b
+    reasoning: medium
     fallbacks: []
     allow_weaker_fallback: false
+    limits:
+      max_model_calls: 6
+      max_tool_calls: 12
+      wall_seconds: 900
+      inactivity_seconds: 300
+      max_retries: 1
+      soft_usd: 0.0
+      hard_usd: 0.0
+
+  fixer:
+    description: One bounded correction cycle against an exact deterministic failure.
+    primary: qwen3.8-27b
+    reasoning: medium
+    fallbacks: []
+    allow_weaker_fallback: false
+    limits:
+      max_model_calls: 3
+      max_tool_calls: 6
+      wall_seconds: 360
+      inactivity_seconds: 150
+      max_retries: 1
+      soft_usd: 0.0
+      hard_usd: 0.0
+
+  fixer_remote:
+    description: Remote repair, same cheap family as the writer. Explicitly selected only.
+    primary: gemini-3.7-flash
+    reasoning: medium
+    fallbacks: []
+    allow_weaker_fallback: false
+    limits:
+      max_model_calls: 3
+      max_tool_calls: 6
+      wall_seconds: 360
+      inactivity_seconds: 150
+      max_retries: 1
+      soft_usd: 0.06
+      hard_usd: 0.12
+
+  reviewer:
+    description: >-
+      Independent review from a different family than the writer. Receives a
+      deterministic review packet, has ZERO tools, and answers exactly once.
+    primary: deepseek-v4-pro
+    reasoning: high
+    fallbacks: []
+    allow_weaker_fallback: false
+    limits:
+      max_model_calls: 2
+      max_tool_calls: 0
+      wall_seconds: 300
+      inactivity_seconds: 180
+      max_retries: 0
+      soft_usd: 0.12
+      hard_usd: 0.25
+
+  resolver:
+    description: >-
+      Material architectural or requirement disagreements ONLY. Never routine
+      work, never a "final verifier", never part of a green workflow.
+    primary: glm-5.2
+    reasoning: xhigh
+    fallbacks: []
+    allow_weaker_fallback: false
+    limits:
+      max_model_calls: 1
+      max_tool_calls: 0
+      wall_seconds: 420
+      inactivity_seconds: 240
+      max_retries: 0
+      soft_usd: 0.08
+      hard_usd: 0.15
+
+# Whole-run budget. Checked before every paid generation alongside the role
+# budget and the daily cap. Crossing the hard line requires a human, not a flag.
+run_budget:
+  soft_usd: 0.60
+  hard_usd: 1.00
 
 # Escalation: (stage, complexity) -> role. `complexity` defaults to the task's
 # own `risk` field and can be overridden per run with --complexity.
 #
-# Escalate only when the cheaper step cannot answer the question:
-#   deterministic tool -> scout -> writer -> reviewer -> resolver
-#   -> resolver_crosscheck -> fallback
-#
-# `scout`, `resolve` and `resolve_crosscheck` are routed here but have no v4
-# stage yet; they are reachable through --model today and are already wired for
-# when those stages land. `plan` uses the writer role because planning is
-# writing, not reviewing.
+# An unknown (stage, complexity) pair resolves to NO role and FAILS CLOSED.
+# There is deliberately no default role: a stage nobody configured must stop the
+# run, not quietly borrow someone else's model and budget.
 escalation:
   low:
     scout: scout
     plan: writer
     implement: writer
-    review: cheap_reviewer
+    fix: fixer
+    review: reviewer
   medium:
     scout: scout
     plan: writer
     implement: writer
+    fix: fixer
     review: reviewer
   high:
     scout: scout
     plan: writer
     implement: writer
+    fix: fixer
     review: reviewer
     resolve: resolver
   very_high:
     scout: scout
     plan: writer
     implement: writer
+    fix: fixer
     review: reviewer
     resolve: resolver
-    resolve_crosscheck: resolver_crosscheck
 
-# Model privileges per stage. Planners and reviewers get NO tools at all — this
-# is enforced by the adapter's argv, not by asking the model nicely.
+# Model privileges per stage, enforced by argv, not by asking the model nicely.
+# Reviewers and resolvers get `--no-tools`: the process is handed no tool at all.
 privileges:
+  scout:      {tools: none,  bash: false, write_set_only: false}
   plan:       {tools: none,  bash: false, write_set_only: false}
   review:     {tools: none,  bash: false, write_set_only: false}
+  resolve:    {tools: none,  bash: false, write_set_only: false}
   implement:  {tools: edit,  bash: false, write_set_only: true}
+  fix:        {tools: edit,  bash: false, write_set_only: true}
 
 diversity:
-  # For these complexity levels, plan / implement / review must not all come
-  # from one model family. Violations are reported, never silently accepted.
+  # For these complexity levels, implement / review must not come from one
+  # family. Violations are reported, never silently accepted.
   enforce_for: [high, very_high]
