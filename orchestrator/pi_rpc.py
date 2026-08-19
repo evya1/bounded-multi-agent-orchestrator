@@ -832,7 +832,20 @@ def build_rpc_argv(
     if tools == "none":
         argv.append("--no-tools")
     else:
-        allowed = list(tools) if isinstance(tools, list) else ["read", "ls", "find", "grep", "edit", "write"]
+        # The `edit` privilege is the IMPLEMENTER/FIXER role. Its prompt states
+        # "your job is to edit; proving the code works is not delegated to you",
+        # and the context compiler already includes every write_set file VERBATIM.
+        # Granting read/ls/find/grep lets a chatty model burn its whole bounded
+        # tool budget re-scouting files it already has (observed: 11 reads, 0
+        # edits, MAX_MODEL_CALLS abort). Edit/write only forces direct edits from
+        # the verbatim context. If a task needs material not in its packet, the
+        # worker must STOP_NEEDS_ORCHESTRATOR (the bounded contract), not scout.
+        if tools == "edit":
+            allowed = ["edit", "write"]
+        elif isinstance(tools, list):
+            allowed = list(tools)
+        else:
+            allowed = ["read", "ls", "find", "grep", "edit", "write"]
         if allow_bash:
             allowed.append("bash")
         argv += ["--tools", ",".join(allowed)]

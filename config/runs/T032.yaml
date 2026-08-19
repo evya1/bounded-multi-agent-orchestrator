@@ -1,0 +1,24 @@
+# Bounded run for T032 — internal reporting artifact contract (NOT OFFICIAL).
+# The police implementation already exists at task/T016-internal-artifact-contract (af4dead),
+# replicated into the T032 worktree. This run exercises the full orchestrated path
+# (fresh Pi RPC worker -> agent_settled -> structured result -> deterministic validation)
+# and is the authoritative independent review carrier.
+repo: police
+task: T032
+complexity: low
+validation:
+  level1:
+    - uv run pytest tests/contract/report_schemas -q
+    - uv run ruff check src/police_peer/reporting tests/contract/report_schemas
+  level2:
+    - uv run pytest tests/contract/report_schemas -q
+    - uv run ruff check src/police_peer/reporting tests/contract/report_schemas
+  level3:
+    - uv run pytest -q
+    - uv run ruff check .
+    - uv run python scripts/run_quality_gates.py
+    - uv run uv lock --check
+notes: >-
+  T032 carries the OPEN-001 internal reporting artifact contract. Official schema
+  adoption stays gated on INPUT-001 (carried by T016). Validation commands mirror the
+  task's Verification section.

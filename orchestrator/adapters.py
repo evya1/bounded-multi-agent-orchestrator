@@ -135,7 +135,16 @@ class PiAdapter(Adapter):
         if tools == "none":
             argv.append("--no-tools")
         else:
-            allowed = ["read", "ls", "find", "grep", "edit", "write"] if tools == "edit" else list(tools)
+            # The `edit` privilege is the IMPLEMENTER/FIXER role. Its prompt states
+            # "your job is to edit; proving the code works is not delegated to you",
+            # and the context compiler already includes every write_set file VERBATIM.
+            # Granting read/ls/find/grep lets a chatty model burn its whole bounded
+            # tool budget re-scouting files it already has (observed: 11 reads, 0
+            # edits, MAX_MODEL_CALLS abort). Edit/write only forces direct edits from
+            # the verbatim context and keeps the bounded tool budget for actual work.
+            # If a task genuinely needs material not in its packet, the worker must
+            # STOP_NEEDS_ORCHESTRATOR (the bounded contract), not silently scout.
+            allowed = ["edit", "write"] if tools == "edit" else list(tools)
             if privileges.get("bash"):
                 allowed.append("bash")
             argv += ["--tools", ",".join(allowed)]
